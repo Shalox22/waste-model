@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import json
 from datetime import datetime
+import shutil
+import uuid
 
 app = FastAPI(
     title="Trash Detection API",
@@ -15,14 +17,24 @@ app = FastAPI(
     version="1.0.0"
 )
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+MODEL_DIR = ROOT_DIR / "model"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_MODEL_NAME = os.getenv("MODEL_PATH", "yolo26n.pt")
+ACTIVE_MODEL_PATH = MODEL_DIR / DEFAULT_MODEL_NAME
+
+def load_yolo_model(path: Path):
+    return YOLO(str(path), task="detect")
+
 # Load model once
-MODEL_PATH = os.getenv("MODEL_PATH", "yolo26n.pt")
-model = YOLO(MODEL_PATH, task="detect")
-# Waste-style class filter via env (COCO proxies: bottle, cup, bowl by default).
+if not ACTIVE_MODEL_PATH.exists():
+    raise RuntimeError(f"Model file not found: {ACTIVE_MODEL_PATH}")
+
+model = load_yolo_model(ACTIVE_MODEL_PATH)
 _PREDICT_KW = predict_kwargs(waste_class_indices(model.names))
 
 # Create detections directory if it doesn't exist
-DETECTIONS_DIR = Path("../detections")
+DETECTIONS_DIR = ROOT_DIR / "detections"
 DETECTIONS_DIR.mkdir(exist_ok=True)
 
 
@@ -44,7 +56,66 @@ def home():
 @app.get("/health")
 def health():
     """Health check for Docker"""
-    return {"status": "healthy", "model_loaded": True}
+    return {"status": "healthy", "model_loaded": model is not None, "model_path": str(ACTIVE_MODEL_PATH)}
+
+
+@app.get("/models/status")
+def model_status():
+    return {
+        "model_loaded": model is not None,
+        "model_path": str(ACTIVE_MODEL_PATH),
+        "classes": list(model.names) if model is not None else [],
+    }
+
+
+@app.post("/models/upload")
+async def upload_model(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in {".pt", ".onnx"}:
+        raise HTTPException(status_code=400, detail="Model file must be .pt or .onnx")
+
+    temp_path = MODEL_DIR / f"upload_{uuid.uuid4().hex}{ext}"
+    try:
+        contents = await file.read()
+        temp_path.write_bytes(contents)
+
+        new_model = load_yolo_model(temp_path)
+    except Exception as e:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise HTTPException(status_code=400, detail=f"Invalid model file: {str(e)}")
+
+    final_path = MODEL_DIR / file.filename
+    if final_path.exists():
+        backup_path = MODEL_DIR / f"backup_{uuid.uuid4().hex}{ext}"
+        final_path.rename(backup_path)
+    try:
+        temp_path.replace(final_path)
+        global model, _PREDICT_KW, ACTIVE_MODEL_PATH
+        model = new_model
+        ACTIVE_MODEL_PATH = final_path
+        _PREDICT_KW = predict_kwargs(waste_class_indices(model.names))
+    except Exception as e:
+        if final_path.exists():
+            final_path.unlink()
+        if 'backup_path' in locals() and backup_path.exists():
+            backup_path.replace(final_path)
+        raise HTTPException(status_code=500, detail=f"Failed to activate model: {str(e)}")
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        if 'backup_path' in locals() and backup_path.exists():
+            backup_path.unlink(missing_ok=True)
+
+    return {
+        "success": True,
+        "filename": file.filename,
+        "model_path": str(ACTIVE_MODEL_PATH),
+        "classes": list(model.names)
+    }
 
 
 @app.post("/predict/")
