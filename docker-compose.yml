@@ -1,0 +1,32 @@
+services:
+  trash-detector:
+    build: .
+    # Same port on host and inside the container (default 8080).
+    ports:
+      - "${APP_PORT:-8080}:${APP_PORT:-8080}"
+    environment:
+      # Paths match Dockerfile WORKDIR /app/src and COPY layout
+      MODEL_PATH: /app/src/yolo26n.pt
+      LOG_LEVEL: info
+      # Waste-focused detection (see src/waste_classes.py). Override via project `.env`.
+      WASTE_PRESET: ${WASTE_PRESET:-disposables}
+      # Optional overrides — set in `.env` or uncomment here:
+      # WASTE_CLASSES: bottle,cup,bowl
+      # WASTE_DETECT_ALL: "1"
+    volumes:
+      # Mount for camera input (RTSP streams or USB camera)
+      - /dev/video0:/dev/video0
+      # Optional: Mount for storing detection results
+      - ./detections:/app/detections
+    restart: unless-stopped
+    # Allow container to access host's network devices
+    devices:
+      - /dev/video0:/dev/video0
+    # For CCTV camera access, you may need to add network settings
+    # networks:
+    #   - camera-network
+
+# Optional: If you need to connect to external CCTV cameras
+# networks:
+#   camera-network:
+#     driver: bridge
